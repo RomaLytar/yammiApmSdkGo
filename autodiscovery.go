@@ -284,21 +284,23 @@ func (c *autoSQLCollector) Collect(ctx context.Context) (DBMetric, bool) {
 		return DBMetric{}, false
 	}
 
-	stats := c.db.Stats()
 	m := DBMetric{
-		Service:           c.service,
-		ConnectionsActive: uint32(stats.InUse),
-		ConnectionsIdle:   uint32(stats.Idle),
-		ConnectionsMax:    uint32(stats.MaxOpenConnections),
-		Timestamp:         time.Now().Unix(),
+		Service:   c.service,
+		Timestamp: time.Now().Unix(),
 	}
 
-	// Pull the server-side max_connections for Postgres and MySQL —
-	// the database/sql pool cap is rarely the same as the server cap,
-	// and the dashboard wants the server view.
-	if serverMax, ok := c.queryInt(ctx, serverMaxConnQuery(c.driver)); ok && serverMax > 0 {
-		m.ConnectionsMax = uint32(serverMax)
-	}
+	// Connection counts. We deliberately do NOT use database/sql's
+	// db.Stats() here: that returns stats for the SDK's tiny dedicated
+	// monitoring pool (MaxOpenConns=2, used once per metrics tick), not
+	// the host application's pool. The dashboard would always read 0
+	// active / 1 idle, which is what burned us in v0.0.5/v0.0.6.
+	//
+	// Instead we ask Postgres / MySQL for the REAL backend counts on
+	// the current database. This is what users actually want when they
+	// look at a "Connections" widget — the load that the live app is
+	// putting on the server, regardless of which pool implementation
+	// the host happens to use.
+	c.fillConnectionCounts(ctx, &m)
 
 	// DB size.
 	if c.sizeQuery != "" {
@@ -311,6 +313,61 @@ func (c *autoSQLCollector) Collect(ctx context.Context) (DBMetric, bool) {
 	c.fillQueryStats(ctx, &m)
 
 	return m, true
+}
+
+// fillConnectionCounts populates ConnectionsActive / ConnectionsIdle /
+// ConnectionsMax with REAL server-side counts of backends connected to
+// the current database. Falls back to the SDK pool stats only if the
+// server query fails.
+func (c *autoSQLCollector) fillConnectionCounts(ctx context.Context, m *DBMetric) {
+	switch c.driver {
+	case "pgx":
+		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		var active, idle, maxConn int64
+		err := c.db.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE state = 'active')::bigint,
+				COUNT(*) FILTER (WHERE state = 'idle')::bigint,
+				(SELECT setting::int FROM pg_settings WHERE name = 'max_connections')::bigint
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+		`).Scan(&active, &idle, &maxConn)
+		if err == nil {
+			m.ConnectionsActive = uint32(active)
+			m.ConnectionsIdle = uint32(idle)
+			m.ConnectionsMax = uint32(maxConn)
+			return
+		}
+	case "mysql":
+		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		// MySQL exposes per-database connection counts via
+		// information_schema.processlist; max_connections via @@.
+		var active, idle, maxConn int64
+		err := c.db.QueryRowContext(ctx, `
+			SELECT
+				SUM(CASE WHEN COMMAND <> 'Sleep' THEN 1 ELSE 0 END),
+				SUM(CASE WHEN COMMAND  = 'Sleep' THEN 1 ELSE 0 END),
+				(SELECT @@max_connections)
+			FROM information_schema.processlist
+			WHERE DB = DATABASE()
+		`).Scan(&active, &idle, &maxConn)
+		if err == nil {
+			m.ConnectionsActive = uint32(active)
+			m.ConnectionsIdle = uint32(idle)
+			m.ConnectionsMax = uint32(maxConn)
+			return
+		}
+	}
+
+	// Fallback: SDK monitoring pool stats. Honest about being SDK-only,
+	// but better than reporting nothing if the server-side query is
+	// blocked by permissions.
+	stats := c.db.Stats()
+	m.ConnectionsActive = uint32(stats.InUse)
+	m.ConnectionsIdle = uint32(stats.Idle)
+	m.ConnectionsMax = uint32(stats.MaxOpenConnections)
 }
 
 // fillQueryStats populates queries_per_min, slow_queries, avg_query_ms,
@@ -553,19 +610,6 @@ func (c *autoSQLCollector) applyDelta(m *DBMetric, calls, reads, writes, slow in
 	c.prevTotalMs = totalMs
 }
 
-func (c *autoSQLCollector) queryInt(ctx context.Context, q string) (int64, bool) {
-	if q == "" {
-		return 0, false
-	}
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	var v int64
-	if err := c.db.QueryRowContext(ctx, q).Scan(&v); err != nil {
-		return 0, false
-	}
-	return v, true
-}
-
 func (c *autoSQLCollector) queryFloat(ctx context.Context, q string) (float64, bool) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -574,18 +618,6 @@ func (c *autoSQLCollector) queryFloat(ctx context.Context, q string) (float64, b
 		return 0, false
 	}
 	return v, true
-}
-
-// serverMaxConnQuery returns the SQL that exposes the server-wide
-// max_connections value for the given driver. Empty string = unknown.
-func serverMaxConnQuery(driver string) string {
-	switch driver {
-	case "pgx":
-		return "SELECT setting::int FROM pg_settings WHERE name = 'max_connections'"
-	case "mysql":
-		return "SELECT @@max_connections"
-	}
-	return ""
 }
 
 // autoRedisCollector is the in-package Redis collector. Mirrors

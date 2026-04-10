@@ -119,7 +119,7 @@ The auto-discovered DB collector reports two layers of data:
 
 | Field | Where it comes from | Works out of the box? |
 |---|---|---|
-| `connections_active` / `connections_idle` / `connections_max` | `database/sql` pool stats + `pg_settings.max_connections` | Yes |
+| `connections_active` / `connections_idle` / `connections_max` | `pg_stat_activity` + `pg_settings.max_connections` (real backend counts on the current database, NOT the SDK's monitoring pool) | Yes |
 | `size_mb` | `pg_database_size(current_database())` | Yes |
 | `queries_per_min`, `avg_query_ms`, `p95_query_ms`, `max_query_ms`, `slow_queries` | `pg_stat_statements` extension | **Only if the extension is enabled** (see below) |
 
