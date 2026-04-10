@@ -348,6 +348,14 @@ func (c *autoSQLCollector) fillPostgresQueryStats(ctx context.Context, m *DBMetr
 
 	// pg_stat_statements aggregate. The cast to bigint protects us
 	// from int overflow on very long-running instances.
+	//
+	// We MUST scope to the current database. pg_stat_statements is a
+	// shared hash across the whole Postgres instance, and for a
+	// superuser the view returns rows from every database. Without
+	// the dbid filter every service that auto-discovers Postgres on
+	// the same host (e.g. yammi: auth/user/board/comment/notification
+	// all on one cluster) would report identical, summed stats —
+	// which is what burned us in v0.0.5.
 	var calls, slow int64
 	var totalMs, maxMs float64
 	err := c.db.QueryRowContext(ctx, `
@@ -357,22 +365,28 @@ func (c *autoSQLCollector) fillPostgresQueryStats(ctx context.Context, m *DBMetr
 			COALESCE(MAX(max_exec_time), 0)::float,
 			COALESCE(SUM(CASE WHEN mean_exec_time >= $1 THEN calls ELSE 0 END), 0)::bigint
 		FROM pg_stat_statements
+		WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
 	`, float64(c.slowMs)).Scan(&calls, &totalMs, &maxMs, &slow)
 	if err != nil {
 		return // extension missing or permission denied — degrade gracefully
 	}
 
 	// p95 approximation: the slowest mean_exec_time in the top-5%
-	// bucket of statements by call count. Not a true percentile over
-	// individual queries but correlates well with the real p95 on
-	// realistic dashboards.
+	// bucket of statements by call count, scoped to the current
+	// database for the same reason as the aggregate above. Not a true
+	// percentile over individual queries but correlates well with the
+	// real p95 on realistic dashboards.
 	var p95 float64
 	_ = c.db.QueryRowContext(ctx, `
+		WITH local AS (
+		  SELECT mean_exec_time
+		  FROM pg_stat_statements
+		  WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+		)
 		SELECT COALESCE(
-		  (SELECT mean_exec_time
-		   FROM pg_stat_statements
+		  (SELECT mean_exec_time FROM local
 		   ORDER BY mean_exec_time DESC
-		   LIMIT 1 OFFSET GREATEST((SELECT count(*)/20 FROM pg_stat_statements), 0)),
+		   LIMIT 1 OFFSET GREATEST((SELECT count(*)/20 FROM local), 0)),
 		  0
 		)::float
 	`).Scan(&p95)

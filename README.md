@@ -113,6 +113,114 @@ The "no x2" rule lives in `system_collector.go` and is enforced per **group**:
   the SDK never tries to invent counters that already live in your
   `prometheus.client_golang` registry.
 
+## Postgres query statistics (`pg_stat_statements`)
+
+The auto-discovered DB collector reports two layers of data:
+
+| Field | Where it comes from | Works out of the box? |
+|---|---|---|
+| `connections_active` / `connections_idle` / `connections_max` | `database/sql` pool stats + `pg_settings.max_connections` | Yes |
+| `size_mb` | `pg_database_size(current_database())` | Yes |
+| `queries_per_min`, `avg_query_ms`, `p95_query_ms`, `max_query_ms`, `slow_queries` | `pg_stat_statements` extension | **Only if the extension is enabled** (see below) |
+
+If `pg_stat_statements` is not loaded the SDK silently leaves the query
+fields at zero — `connections_*` and `size_mb` keep working — so you
+can integrate the SDK first and turn on the extension later without any
+code change.
+
+### Enabling pg_stat_statements
+
+`pg_stat_statements` is a **standard contrib module** shipped with
+every official Postgres image (`postgres:16`, `postgres:15`, `bitnami/postgresql`,
+RDS, Cloud SQL, …). Turning it on is two steps:
+
+**1. Load the library at server start.** It must be in
+`shared_preload_libraries`, which requires a Postgres restart.
+
+In Docker Compose:
+
+```yaml
+postgres:
+  image: postgres:16-alpine
+  command:
+    - "postgres"
+    - "-c"
+    - "shared_preload_libraries=pg_stat_statements"
+    - "-c"
+    - "pg_stat_statements.track=all"   # include nested statements (e.g. inside functions)
+    - "-c"
+    - "pg_stat_statements.max=5000"    # max distinct statements tracked (LRU)
+```
+
+In a hand-rolled `postgresql.conf`:
+
+```conf
+shared_preload_libraries = 'pg_stat_statements'
+pg_stat_statements.track = all
+pg_stat_statements.max = 5000
+```
+
+On managed Postgres (RDS / Cloud SQL / Azure / Supabase) the same
+parameter is exposed in the parameter group / flags UI; no SSH needed.
+
+**2. Enable the extension inside every database your service uses.**
+The shared library exposes the catalog *machinery* — the actual
+`pg_stat_statements` view only appears in databases where you run:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+```
+
+For a multi-DB setup (auth / user / board / …) drop a one-shot script
+into `/docker-entrypoint-initdb.d/` so fresh volumes self-provision:
+
+```sql
+\c your_db_1
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+\c your_db_2
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+```
+
+For an existing volume just `psql -c "CREATE EXTENSION ..."` in each DB.
+
+### Is it safe in production?
+
+Yes. `pg_stat_statements` is on by default on RDS, Cloud SQL, Aiven and
+most managed Postgres providers, and it is the recommended source of
+query stats in the official Postgres docs. Specifically:
+
+- **Memory cost is fixed and tiny.** It allocates a single shared-memory
+  hash sized by `pg_stat_statements.max` (default 5000 entries, ≈ 1 MB).
+  It does NOT grow with the number of executions.
+- **CPU cost is negligible.** Each statement does one hash lookup and a
+  few atomic counter increments. Benchmarks from EnterpriseDB and
+  PostgreSQL.org consistently show < 1% throughput impact even on
+  OLTP workloads.
+- **No query text leaks beyond the database.** Statements are normalised
+  (`SELECT * FROM users WHERE id = $1`) before being stored — literals
+  and bind parameters are stripped. The SDK does not read the text
+  field at all; it only reads aggregated counters.
+- **No locks taken on user tables.** The view reads from shared memory.
+- **Restartable.** Loading the library requires one Postgres restart.
+  After that, `CREATE EXTENSION` and the SDK pick it up live — no
+  further restart for upgrades.
+
+### What changes after enabling
+
+Within one metrics interval (default 60s) of restarting Postgres:
+
+```
+queries_per_min   0    →   real value
+avg_query_ms      0    →   real value
+p95_query_ms      0    →   approximated p95
+max_query_ms      0    →   max single execution time
+slow_queries      0    →   count of statements with mean ≥ APM_SLOW_QUERY_MS
+```
+
+The SDK uses **delta from the previous tick**, so the first reading
+after enable is still zero (it just seeds the baseline) and the second
+reading onwards is the real per-minute rate.
+
 ## Postgres detailed metrics example
 
 ```go
