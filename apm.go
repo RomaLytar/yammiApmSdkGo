@@ -172,6 +172,11 @@ func (a *APM) metricsLoop() {
 
 // collectAndShip runs every collector and posts the results. Each call is
 // independent — a failure in one collector never blocks the others.
+//
+// It also emits a one-line SDK self-stats summary when cfg.Debug is on.
+// These numbers (events sent, dropped, sender errors) are the only
+// log output the SDK produces under load. Printing payloads was the
+// original debug mode and it cost us the first load test — never again.
 func (a *APM) collectAndShip(ctx context.Context) {
 	if a.system != nil {
 		snap := a.system.Collect(a.prom)
@@ -194,5 +199,13 @@ func (a *APM) collectAndShip(ctx context.Context) {
 		if customs := a.prom.CollectCustom(a.cfg.ServiceName); len(customs) > 0 {
 			a.client.LogCustomMetrics(customs)
 		}
+	}
+
+	if a.cfg.Debug && a.buffer != nil {
+		bs := a.buffer.Stats()
+		cs := a.client.Stats()
+		a.client.logger.Printf("stats service=%s sent=%d errors=%d reject=%d dropped_events=%d dropped_batches=%d queued_events=%d queued_batches=%d",
+			a.cfg.ServiceName, cs.Success, cs.Errors, cs.Reject,
+			bs.DroppedEvents, bs.DroppedBatches, bs.QueuedEvents, bs.QueuedBatches)
 	}
 }

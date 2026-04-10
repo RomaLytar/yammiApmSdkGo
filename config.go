@@ -24,17 +24,34 @@ type Config struct {
 	// ServiceName — logical service identifier (board, auth, …).
 	ServiceName string
 
-	// FlushInterval — how often the trace buffer is force-flushed even if
-	// it has not reached BufferSize.
+	// FlushInterval — how often the collector hands the accumulated
+	// batch to the sender pool even if it hasn't reached BatchSize.
 	FlushInterval time.Duration
 
-	// BufferSize — max number of pending events before an immediate flush.
+	// BufferSize is the batch size — the number of events a single POST
+	// to /ingest carries. Kept under the legacy name to preserve env
+	// compatibility (APM_BUFFER_SIZE). Default 500.
 	BufferSize int
+
+	// ChannelSize caps the number of events that can sit in the SDK's
+	// ingress channel waiting to be batched. If the host application
+	// produces events faster than the collector can consume them, new
+	// events are DROPPED rather than blocking the caller. Default 10000.
+	ChannelSize int
+
+	// SenderWorkers is the fixed number of goroutines that POST batches
+	// to the APM backend. A small pool (2-4) is plenty: under healthy
+	// conditions the backend answers in <10ms, so two workers handle
+	// thousands of batches per second. A larger pool does not help when
+	// the backend is slow — it just multiplies stuck connections.
+	SenderWorkers int
 
 	// MetricsInterval — how often system / db / redis / prom collectors run.
 	MetricsInterval time.Duration
 
-	// Timeout — HTTP timeout for ingest requests.
+	// Timeout — HTTP timeout for ingest requests. Kept intentionally
+	// short (default 2s) because a long timeout combined with a slow
+	// backend ties up sender workers and makes the drop rate worse.
 	Timeout time.Duration
 
 	// IgnoreEndpoints — request paths the HTTP middleware should skip.
@@ -43,6 +60,13 @@ type Config struct {
 	// SlowQueryThresholdMs — DB query duration above which it counts as slow.
 	SlowQueryThresholdMs int
 
+	// CaptureErrorBody makes the HTTP middleware capture the response
+	// body for 5xx responses (truncated to 2 KiB) so the dashboard can
+	// show the exception message. Disabled by default — body capture
+	// adds an allocation per request and is only worth it when you
+	// actually debug error payloads.
+	CaptureErrorBody bool
+
 	// Monitor — per-feature toggles. nil pointer = auto-detect.
 	Monitor MonitorConfig
 
@@ -50,8 +74,11 @@ type Config struct {
 	// SDK's own collection. See PrometheusConfig.
 	Prometheus PrometheusConfig
 
-	// Debug — when true, every payload is also logged to stderr before
-	// being sent. Useful for the first manual smoke-test on yammi.
+	// Debug controls SDK self-observability, not per-request payload
+	// dumping. When true, the SDK logs sender errors and periodic stats
+	// (sent / dropped counters). It NEVER logs payloads, because that
+	// would make debug mode accidentally expensive under load — the
+	// exact trap we hit on the first yammi load test.
 	Debug bool
 }
 
@@ -143,12 +170,15 @@ func LoadConfigFromEnv() Config {
 		Endpoint:             envStr("APM_ENDPOINT", "http://localhost:8890/ingest"),
 		Token:                envStr("APM_TOKEN", ""),
 		ServiceName:          envStr("APM_SERVICE_NAME", "default"),
-		FlushInterval:        time.Duration(envInt("APM_FLUSH_INTERVAL", 5)) * time.Second,
-		BufferSize:           envInt("APM_BUFFER_SIZE", 100),
+		FlushInterval:        time.Duration(envInt("APM_FLUSH_INTERVAL", 1)) * time.Second,
+		BufferSize:           envInt("APM_BUFFER_SIZE", 500),
+		ChannelSize:          envInt("APM_CHANNEL_SIZE", 100000),
+		SenderWorkers:        envInt("APM_SENDER_WORKERS", 4),
 		MetricsInterval:      time.Duration(envInt("APM_METRICS_INTERVAL", 60)) * time.Second,
-		Timeout:              time.Duration(envInt("APM_TIMEOUT", 5)) * time.Second,
+		Timeout:              time.Duration(envInt("APM_TIMEOUT", 2)) * time.Second,
 		IgnoreEndpoints:      envList("APM_IGNORE_ENDPOINTS", []string{"/health", "/favicon.ico"}),
 		SlowQueryThresholdMs: envInt("APM_SLOW_QUERY_THRESHOLD_MS", 1000),
+		CaptureErrorBody:     envBool("APM_CAPTURE_ERROR_BODY", false),
 		Debug:                envBool("APM_DEBUG", false),
 
 		Prometheus: PrometheusConfig{

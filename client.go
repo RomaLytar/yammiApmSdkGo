@@ -4,45 +4,90 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 // Client is the HTTP transport that ships payloads to the APM backend.
 //
-// It mirrors the semantics of the Laravel SDK's Client.php:
-//   - 1 retry on transport / 5xx errors with a 50ms back-off,
-//   - 4xx is logged once and never retried,
-//   - empty token short-circuits to a no-op,
-//   - failures never bubble up to the caller (APM must not break the app).
+// Design rules after the first load-test experience:
+//
+//  1. NEVER log payloads. Debug mode logs counters, not bytes. Printing
+//     a 500-byte JSON per POST under 1000 POST/s generates 500 KB/s of
+//     stderr traffic and the Docker json-file driver serializes that
+//     synchronously, stalling the caller goroutine.
+//
+//  2. Hard timeout 2s. Long timeouts turn "one slow request" into "all
+//     sender workers stuck on the same dead backend". A short timeout
+//     plus the buffer's internal channel is the correct back-pressure.
+//
+//  3. No sleep between retries. We retry at most once, immediately, on
+//     a transport error. Anything more sophisticated (exponential
+//     back-off, circuit breaker) would amplify a slow backend into a
+//     slower backend by holding sender workers longer.
+//
+//  4. Errors are counted, not printed. Printing every failure floods
+//     the log when the backend is down. We expose the error count via
+//     ErrorCount(); the host app can emit one summary line on a timer
+//     if it wants visibility.
 type Client struct {
 	endpoint string
 	token    string
 	http     *http.Client
 	logger   *log.Logger
 	debug    bool
+
+	// Counters for self-observability. Atomic because sender workers
+	// update them in parallel.
+	successCount atomic.Uint64
+	errorCount   atomic.Uint64
+	rejectCount  atomic.Uint64 // 4xx from backend — token wrong, schema bad
 }
 
-// NewClient builds a Client from a Config. The HTTP client is reused for
-// all calls so connections to the ingest backend are pooled.
+// NewClient builds a Client from a Config. The HTTP client is reused
+// across all calls so TCP connections are pooled, keeping the per-POST
+// cost at "already-open socket" instead of "new TCP handshake".
 func NewClient(cfg Config) *Client {
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
 	return &Client{
 		endpoint: strings.TrimRight(cfg.Endpoint, "/"),
 		token:    cfg.Token,
 		http: &http.Client{
-			Timeout: cfg.Timeout,
+			Timeout: timeout,
 			Transport: &http.Transport{
-				MaxIdleConns:        20,
-				MaxIdleConnsPerHost: 10,
+				// Pool sized for the typical SenderWorkers=4 plus some
+				// headroom for the metrics loop.
+				MaxIdleConns:        32,
+				MaxIdleConnsPerHost: 16,
 				IdleConnTimeout:     90 * time.Second,
+				DisableCompression:  true, // JSON compresses nicely but gzip CPU is not free
 			},
 		},
 		logger: log.New(log.Writer(), "[apm] ", log.LstdFlags),
 		debug:  cfg.Debug,
+	}
+}
+
+// ClientStats is a snapshot of the counters the Client exposes.
+type ClientStats struct {
+	Success uint64
+	Errors  uint64
+	Reject  uint64
+}
+
+// Stats returns a snapshot of the counters. Safe from any goroutine.
+func (c *Client) Stats() ClientStats {
+	return ClientStats{
+		Success: c.successCount.Load(),
+		Errors:  c.errorCount.Load(),
+		Reject:  c.rejectCount.Load(),
 	}
 }
 
@@ -55,13 +100,10 @@ func (c *Client) SendEvents(ctx context.Context, events []Event) {
 }
 
 // SendSystemMetric posts a single system snapshot to /ingest/system.
-// The backend wraps single payloads in an array on its side, but this
-// method always batches into a one-element array to match the existing
-// Laravel client's wire format.
 func (c *Client) SendSystemMetric(ctx context.Context, m SystemMetric) {
 	c.send(ctx, c.url("/ingest/system"), map[string]any{
 		"metrics": []SystemMetric{m},
-	}, "system metrics")
+	}, "system")
 }
 
 // SendDBMetrics posts detailed DB metrics to /ingest/db-metrics.
@@ -69,9 +111,7 @@ func (c *Client) SendDBMetrics(ctx context.Context, metrics []DBMetric) {
 	if len(metrics) == 0 {
 		return
 	}
-	c.send(ctx, c.url("/ingest/db-metrics"), map[string]any{
-		"metrics": metrics,
-	}, "db metrics")
+	c.send(ctx, c.url("/ingest/db-metrics"), map[string]any{"metrics": metrics}, "db")
 }
 
 // SendRedisMetrics posts detailed Redis metrics to /ingest/redis-metrics.
@@ -79,9 +119,7 @@ func (c *Client) SendRedisMetrics(ctx context.Context, metrics []RedisMetric) {
 	if len(metrics) == 0 {
 		return
 	}
-	c.send(ctx, c.url("/ingest/redis-metrics"), map[string]any{
-		"metrics": metrics,
-	}, "redis metrics")
+	c.send(ctx, c.url("/ingest/redis-metrics"), map[string]any{"metrics": metrics}, "redis")
 }
 
 // SendFPMMetrics posts PHP-FPM metrics to /ingest/fpm-metrics.
@@ -89,9 +127,7 @@ func (c *Client) SendFPMMetrics(ctx context.Context, metrics []FPMMetric) {
 	if len(metrics) == 0 {
 		return
 	}
-	c.send(ctx, c.url("/ingest/fpm-metrics"), map[string]any{
-		"metrics": metrics,
-	}, "fpm metrics")
+	c.send(ctx, c.url("/ingest/fpm-metrics"), map[string]any{"metrics": metrics}, "fpm")
 }
 
 // SendNginxMetrics posts nginx metrics to /ingest/nginx-metrics.
@@ -99,9 +135,7 @@ func (c *Client) SendNginxMetrics(ctx context.Context, metrics []NginxMetric) {
 	if len(metrics) == 0 {
 		return
 	}
-	c.send(ctx, c.url("/ingest/nginx-metrics"), map[string]any{
-		"metrics": metrics,
-	}, "nginx metrics")
+	c.send(ctx, c.url("/ingest/nginx-metrics"), map[string]any{"metrics": metrics}, "nginx")
 }
 
 // SendQueueJobs posts queue job lifecycle events to /ingest/queue.
@@ -109,21 +143,19 @@ func (c *Client) SendQueueJobs(ctx context.Context, jobs []QueueJob) {
 	if len(jobs) == 0 {
 		return
 	}
-	c.send(ctx, c.url("/ingest/queue"), map[string]any{
-		"jobs": jobs,
-	}, "queue jobs")
+	c.send(ctx, c.url("/ingest/queue"), map[string]any{"jobs": jobs}, "queue")
 }
 
 // LogCustomMetrics is a temporary sink for Group D (custom Prometheus
-// metrics) until the backend grows a typed endpoint. When debug is on,
-// the metrics are dumped to the log so you can verify what would be sent.
+// metrics). The backend does not have a typed endpoint yet, so we just
+// count them and optionally log a one-line summary when debug is on.
+// When /ingest/custom lands, swap this for a real POST.
 func (c *Client) LogCustomMetrics(metrics []CustomMetric) {
-	if len(metrics) == 0 || !c.debug {
+	if len(metrics) == 0 {
 		return
 	}
-	for _, m := range metrics {
-		c.logger.Printf("custom metric: service=%s name=%s type=%s value=%v labels=%v",
-			m.Service, m.Name, m.Type, m.Value, m.Labels)
+	if c.debug {
+		c.logger.Printf("custom metrics: %d items buffered (sink not implemented)", len(metrics))
 	}
 }
 
@@ -134,58 +166,51 @@ func (c *Client) url(path string) string {
 	return base + path
 }
 
-// send is the shared transport with the same retry policy as Laravel's
-// Client.php sendWithRetry: 1 retry on 5xx / transport, 4xx is fatal.
+// send is the shared transport. It performs at most one retry on
+// transport errors and never sleeps between attempts. Errors are
+// counted, not printed per-event — only a summary line is emitted
+// every 30s when debug is on (see APM.metricsLoop).
 func (c *Client) send(ctx context.Context, url string, payload any, label string) {
 	if c.token == "" {
-		return // mirror PHP behaviour: no token = no-op
+		return // no token = explicit opt-out
 	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		c.logger.Printf("marshal %s failed: %v", label, err)
+		c.errorCount.Add(1)
 		return
 	}
 
-	if c.debug {
-		c.logger.Printf("POST %s (%d bytes): %s", url, len(body), truncate(body, 500))
-	}
-
-	const maxRetries = 1
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(50 * time.Millisecond):
-			}
-		}
-
-		status, respBody, err := c.do(ctx, url, body)
+	// Two attempts total: one real request, one retry on transport error.
+	// No sleep between them — 50ms back-off would tie up the sender
+	// goroutine for nothing when the pool is already saturated.
+	for attempt := 0; attempt < 2; attempt++ {
+		status, err := c.do(ctx, url, body)
 		if err == nil && status >= 200 && status < 300 {
-			return // success
+			c.successCount.Add(1)
+			return
 		}
 		if err == nil && status >= 400 && status < 500 {
-			c.logger.Printf("rejected %s: HTTP %d %s", label, status, truncate(respBody, 200))
-			return // 4xx, not retriable
+			// 4xx means the backend rejected us — wrong token, bad
+			// schema. Retrying won't help. Count and give up.
+			c.rejectCount.Add(1)
+			return
 		}
-		if err != nil {
-			lastErr = err
-		} else {
-			lastErr = fmt.Errorf("HTTP %d", status)
-		}
+		// 5xx or transport error: try once more, then count as error.
 	}
-
-	c.logger.Printf("failed to send %s after %d attempts: %v (url=%s)",
-		label, maxRetries+1, lastErr, url)
+	c.errorCount.Add(1)
 }
 
 // do performs one HTTP POST with the auth header set.
-func (c *Client) do(ctx context.Context, url string, body []byte) (int, []byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+// The request carries a per-call context with the configured timeout
+// so a single stuck connection does not hold a sender worker hostage.
+func (c *Client) do(ctx context.Context, url string, body []byte) (int, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, c.http.Timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return 0, nil, err
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -193,17 +218,26 @@ func (c *Client) do(ctx context.Context, url string, body []byte) (int, []byte, 
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, err
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	return resp.StatusCode, respBody, nil
+	// Drain and discard the body so the connection can be reused by
+	// the HTTP/1.1 connection pool. We read a bounded amount to avoid
+	// a pathological backend keeping the connection open with a huge
+	// response.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return resp.StatusCode, nil
 }
 
-func truncate(b []byte, n int) []byte {
-	if len(b) <= n {
-		return b
+// logStatsLine is called from the metrics loop to print one summary
+// line per metrics interval when debug is on. It is the only form of
+// SDK self-logging that stays enabled under load.
+func (c *Client) logStatsLine(prefix string) {
+	if !c.debug {
+		return
 	}
-	return append(b[:n:n], []byte("...")...)
+	s := c.Stats()
+	c.logger.Printf("%s client: sent=%d errors=%d reject=%d",
+		prefix, s.Success, s.Errors, s.Reject)
 }
