@@ -413,17 +413,30 @@ func (c *autoSQLCollector) fillPostgresQueryStats(ctx context.Context, m *DBMetr
 	// the same host (e.g. yammi: auth/user/board/comment/notification
 	// all on one cluster) would report identical, summed stats —
 	// which is what burned us in v0.0.5.
-	var calls, slow int64
+	//
+	// pg_stat_statements does not expose a "command type" column, so
+	// we classify reads vs writes by the first keyword of the
+	// normalized query text. WITH-prefixed reads (CTEs) count as
+	// reads; the rare write-CTE case is misclassified but cheap to
+	// live with.
+	var calls, slow, reads, writes int64
 	var totalMs, maxMs float64
 	err := c.db.QueryRowContext(ctx, `
+		WITH q AS (
+		  SELECT calls, mean_exec_time, total_exec_time, max_exec_time,
+		         lower(split_part(ltrim(query), ' ', 1)) AS cmd
+		  FROM pg_stat_statements
+		  WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+		)
 		SELECT
 			COALESCE(SUM(calls), 0)::bigint,
 			COALESCE(SUM(total_exec_time), 0)::float,
 			COALESCE(MAX(max_exec_time), 0)::float,
-			COALESCE(SUM(CASE WHEN mean_exec_time >= $1 THEN calls ELSE 0 END), 0)::bigint
-		FROM pg_stat_statements
-		WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
-	`, float64(c.slowMs)).Scan(&calls, &totalMs, &maxMs, &slow)
+			COALESCE(SUM(CASE WHEN mean_exec_time >= $1 THEN calls ELSE 0 END), 0)::bigint,
+			COALESCE(SUM(CASE WHEN cmd IN ('select','with') THEN calls ELSE 0 END), 0)::bigint,
+			COALESCE(SUM(CASE WHEN cmd IN ('insert','update','delete','merge') THEN calls ELSE 0 END), 0)::bigint
+		FROM q
+	`, float64(c.slowMs)).Scan(&calls, &totalMs, &maxMs, &slow, &reads, &writes)
 	if err != nil {
 		return // extension missing or permission denied — degrade gracefully
 	}
@@ -449,7 +462,7 @@ func (c *autoSQLCollector) fillPostgresQueryStats(ctx context.Context, m *DBMetr
 	`).Scan(&p95)
 
 	// Compute per-minute delta from the previous snapshot.
-	c.applyDelta(m, calls, 0, 0, slow, totalMs, maxMs, p95)
+	c.applyDelta(m, calls, reads, writes, slow, totalMs, maxMs, p95)
 }
 
 // fillMySQLQueryStats uses SHOW GLOBAL STATUS — always available, no
