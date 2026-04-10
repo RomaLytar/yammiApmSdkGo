@@ -59,10 +59,25 @@ type APM struct {
 	// Shutdown() calls them so the SDK does not leak connections.
 	autoCloseFns []func()
 
+	// healthProbes are small callbacks registered by auto-discovery
+	// (one per discovered resource). SystemCollector calls them on
+	// every metrics tick to fill db_ok / db_ping_ms / redis_ok /
+	// redis_ping_ms in the SystemMetric payload. Having the probes
+	// live here rather than inside SystemCollector avoids a circular
+	// import between apm/ and collector/ and lets the probes share
+	// the same pooled connection already opened by auto-discovery.
+	dbProbe    healthProbe
+	redisProbe healthProbe
+
 	stopCh chan struct{}
 	doneCh chan struct{}
 	once   sync.Once
 }
+
+// healthProbe is a one-shot "are you alive and how fast did you
+// answer" check. nil result means "no probe configured" and
+// SystemCollector leaves the corresponding fields alone.
+type healthProbe func(ctx context.Context) (ok bool, pingMs float32, errMsg string)
 
 // New initialises the SDK with the given config. If cfg.Enabled is false,
 // New returns a no-op APM that satisfies the same API but does nothing
@@ -196,7 +211,7 @@ func (a *APM) metricsLoop() {
 // original debug mode and it cost us the first load test — never again.
 func (a *APM) collectAndShip(ctx context.Context) {
 	if a.system != nil {
-		snap := a.system.Collect(a.prom)
+		snap := a.system.Collect(a.prom, a.dbProbe, a.redisProbe)
 		a.client.SendSystemMetric(ctx, snap)
 	}
 

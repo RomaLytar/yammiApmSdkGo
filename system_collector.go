@@ -1,6 +1,7 @@
 package apm
 
 import (
+	"context"
 	"os"
 	"runtime"
 	"strconv"
@@ -39,9 +40,14 @@ func NewSystemCollector(cfg Config) *SystemCollector {
 // is passed and the SourcePolicy says Prometheus owns the host group, the
 // host fields are filled from Prometheus and local /proc reads are skipped.
 //
+// dbProbe / redisProbe are optional health checks registered by
+// auto-discovery. When non-nil they are called with a short timeout
+// and their results populate db_ok / db_ping_ms / redis_ok /
+// redis_ping_ms — the fields the dashboard's "Uptime" gauge reads.
+//
 // This is the place where the "no x2" rule is enforced for Group A: we
 // never read /proc and Prometheus for the same field within one snapshot.
-func (s *SystemCollector) Collect(prom *PrometheusCollector) SystemMetric {
+func (s *SystemCollector) Collect(prom *PrometheusCollector, dbProbe, redisProbe healthProbe) SystemMetric {
 	m := SystemMetric{
 		Service:   s.cfg.ServiceName,
 		Timestamp: time.Now().Unix(),
@@ -75,11 +81,28 @@ func (s *SystemCollector) Collect(prom *PrometheusCollector) SystemMetric {
 	// double here only on Kubernetes; for now we keep this SDK-only.
 	s.fillContainerMetrics(&m)
 
-	// Service health: db_ok, redis_ok. These are not pulled from
-	// Prometheus by SystemCollector — they come from the dedicated
-	// DBCollector / RedisCollector if attached. SystemMetric only carries
-	// the boolean health flag, which we leave at zero unless someone
-	// explicitly fills it via the optional setters below.
+	// Service health probes. Each probe gets up to 1 second (enforced
+	// inside the probe itself) so a hung DB or Redis cannot block the
+	// metrics loop. If a probe is nil, the corresponding field stays
+	// at its zero value — SystemCollector never guesses.
+	if dbProbe != nil {
+		probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ok, pingMs, errMsg := dbProbe(probeCtx)
+		cancel()
+		m.DBOK = ok
+		m.DBPingMs = pingMs
+		m.DBError = errMsg
+		features = append(features, "db")
+	}
+	if redisProbe != nil {
+		probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ok, pingMs, errMsg := redisProbe(probeCtx)
+		cancel()
+		m.RedisOK = ok
+		m.RedisPingMs = pingMs
+		m.RedisError = errMsg
+		features = append(features, "redis")
+	}
 
 	// Runtime feature flag (so the dashboard can render Go-specific tabs).
 	if s.cfg.Monitor.Runtime == nil || *s.cfg.Monitor.Runtime {

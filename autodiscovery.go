@@ -38,19 +38,24 @@ func (a *APM) autoDiscover() {
 		return
 	}
 
-	// DB auto-discovery.
+	// DB auto-discovery. Besides wiring the detailed collector we
+	// install a cheap health probe so SystemCollector can set
+	// db_ok / db_ping_ms on every tick — that's what drives the
+	// "Uptime" gauge in the dashboard.
 	if !a.cfg.DisableAutoDB {
-		if dbCol, closer := tryBuildAutoDBCollector(a.cfg); dbCol != nil {
+		if dbCol, closer, probe := tryBuildAutoDBCollector(a.cfg); dbCol != nil {
 			a.AttachDBCollector(dbCol)
 			a.autoCloseFns = append(a.autoCloseFns, closer)
+			a.dbProbe = probe
 		}
 	}
 
-	// Redis auto-discovery.
+	// Redis auto-discovery, same pattern.
 	if !a.cfg.DisableAutoRedis {
-		if redisCol, closer := tryBuildAutoRedisCollector(a.cfg); redisCol != nil {
+		if redisCol, closer, probe := tryBuildAutoRedisCollector(a.cfg); redisCol != nil {
 			a.AttachRedisCollector(redisCol)
 			a.autoCloseFns = append(a.autoCloseFns, closer)
+			a.redisProbe = probe
 		}
 	}
 }
@@ -60,20 +65,20 @@ func (a *APM) autoDiscover() {
 // settings, and returns a collector.SQLCollector-equivalent plus its
 // Close function. Returns (nil, nil) on any step failure — auto-
 // discovery is best-effort and must never block startup.
-func tryBuildAutoDBCollector(cfg Config) (DBCollector, func()) {
+func tryBuildAutoDBCollector(cfg Config) (DBCollector, func(), healthProbe) {
 	raw := firstNonEmpty(cfg.APMDatabaseURL, cfg.DatabaseURL)
 	if raw == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	driver, dsn, sizeQuery, err := parseDatabaseURL(raw)
 	if err != nil {
-		return nil, nil // bad URL, don't crash the host app
+		return nil, nil, nil // bad URL, don't crash the host app
 	}
 
 	db, err := sql.Open(driver, dsn)
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	// Dedicated, tiny pool — the collector only needs one connection
 	// per metrics interval. A 2-connection ceiling keeps idle overhead
@@ -93,21 +98,35 @@ func tryBuildAutoDBCollector(cfg Config) (DBCollector, func()) {
 
 	collector := newAutoSQLCollector(db, cfg.ServiceName, driver, sizeQuery, cfg.SlowQueryThresholdMs)
 	closer := func() { _ = db.Close() }
-	return collector, closer
+
+	// Health probe: called from SystemCollector every metrics tick.
+	// One ping, hard 1-second timeout so a hung DB cannot block the
+	// system metrics loop.
+	probe := func(ctx context.Context) (bool, float32, string) {
+		pingCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+		defer cancel()
+		start := time.Now()
+		if err := db.PingContext(pingCtx); err != nil {
+			return false, 0, truncateErr(err.Error())
+		}
+		return true, float32(time.Since(start).Seconds() * 1000), ""
+	}
+
+	return collector, closer, probe
 }
 
 // tryBuildAutoRedisCollector parses the configured URL, opens a
 // dedicated go-redis client, and returns a Redis collector. Same
 // best-effort policy as the DB variant.
-func tryBuildAutoRedisCollector(cfg Config) (RedisCollector, func()) {
+func tryBuildAutoRedisCollector(cfg Config) (RedisCollector, func(), healthProbe) {
 	raw := firstNonEmpty(cfg.APMRedisURL, cfg.RedisURL)
 	if raw == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	opts, err := redis.ParseURL(raw)
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	// Tiny pool — only the INFO command runs against this client, once
 	// per metrics interval. PoolSize=2 is generous.
@@ -123,7 +142,27 @@ func tryBuildAutoRedisCollector(cfg Config) (RedisCollector, func()) {
 
 	collector := newAutoRedisCollector(client, cfg.ServiceName)
 	closer := func() { _ = client.Close() }
-	return collector, closer
+
+	probe := func(ctx context.Context) (bool, float32, string) {
+		pingCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+		defer cancel()
+		start := time.Now()
+		if err := client.Ping(pingCtx).Err(); err != nil {
+			return false, 0, truncateErr(err.Error())
+		}
+		return true, float32(time.Since(start).Seconds() * 1000), ""
+	}
+
+	return collector, closer, probe
+}
+
+// truncateErr caps error messages at 300 chars — db_error / redis_error
+// columns in ClickHouse are sized for short human messages.
+func truncateErr(s string) string {
+	if len(s) <= 300 {
+		return s
+	}
+	return s[:300]
 }
 
 // parseDatabaseURL examines the URL scheme to pick a driver name for
