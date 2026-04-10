@@ -67,6 +67,31 @@ type Config struct {
 	// actually debug error payloads.
 	CaptureErrorBody bool
 
+	// DatabaseURL is the fallback for DB auto-discovery. The SDK
+	// reads it from the standard DATABASE_URL env var automatically.
+	// Set it explicitly in code only if you're not using env vars.
+	DatabaseURL string
+
+	// APMDatabaseURL, if set, overrides DatabaseURL for DB auto-
+	// discovery. Use it when your application talks to multiple
+	// databases and you want the APM collector pointed at a specific
+	// one (e.g. the read-replica) without changing DATABASE_URL.
+	APMDatabaseURL string
+
+	// RedisURL is the fallback for Redis auto-discovery, same idea.
+	RedisURL string
+
+	// APMRedisURL overrides RedisURL for auto-discovery.
+	APMRedisURL string
+
+	// DisableAutoDB turns off automatic DB collector wiring even if a
+	// DATABASE_URL is present. Use when you want to wire a custom
+	// DBCollector manually via APM.AttachDBCollector.
+	DisableAutoDB bool
+
+	// DisableAutoRedis turns off automatic Redis collector wiring.
+	DisableAutoRedis bool
+
 	// Monitor — per-feature toggles. nil pointer = auto-detect.
 	Monitor MonitorConfig
 
@@ -180,6 +205,16 @@ func LoadConfigFromEnv() Config {
 		SlowQueryThresholdMs: envInt("APM_SLOW_QUERY_THRESHOLD_MS", 1000),
 		CaptureErrorBody:     envBool("APM_CAPTURE_ERROR_BODY", false),
 		Debug:                envBool("APM_DEBUG", false),
+
+		// Auto-discovery defaults: if DATABASE_URL / REDIS_URL exist
+		// in the environment, the SDK picks them up and wires the
+		// collectors without any code change on the host app.
+		DatabaseURL:      envStr("DATABASE_URL", ""),
+		APMDatabaseURL:   envStr("APM_DATABASE_URL", ""),
+		RedisURL:         envStr("REDIS_URL", ""),
+		APMRedisURL:      envStr("APM_REDIS_URL", ""),
+		DisableAutoDB:    envBool("APM_DISABLE_AUTO_DB", false),
+		DisableAutoRedis: envBool("APM_DISABLE_AUTO_REDIS", false),
 
 		Prometheus: PrometheusConfig{
 			Enabled:       envBool("APM_PROMETHEUS_ENABLED", false),

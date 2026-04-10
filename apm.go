@@ -54,6 +54,11 @@ type APM struct {
 	redis  []RedisCollector
 	prom   *PrometheusCollector
 
+	// autoCloseFns holds close functions for resources the SDK opened
+	// itself during auto-discovery (dedicated *sql.DB, redis.Client).
+	// Shutdown() calls them so the SDK does not leak connections.
+	autoCloseFns []func()
+
 	stopCh chan struct{}
 	doneCh chan struct{}
 	once   sync.Once
@@ -83,6 +88,12 @@ func New(cfg Config) (*APM, error) {
 	if cfg.Prometheus.Enabled {
 		a.prom = NewPrometheusCollector(cfg.Prometheus)
 	}
+
+	// Auto-discover DB and Redis based on env vars (DATABASE_URL /
+	// REDIS_URL or APM-specific overrides). This is what makes the
+	// SDK truly zero-code: the host app imports apm and calls New,
+	// and everything else is derived from existing env.
+	a.autoDiscover()
 
 	go a.metricsLoop()
 	return a, nil
@@ -137,6 +148,12 @@ func (a *APM) Shutdown(ctx context.Context) {
 		<-a.doneCh
 		if a.buffer != nil {
 			a.buffer.Stop()
+		}
+		// Close any SDK-owned resources created by auto-discovery
+		// (dedicated *sql.DB, redis.Client). Done LAST so the final
+		// metrics collection in metricsLoop can still use them.
+		for _, fn := range a.autoCloseFns {
+			fn()
 		}
 	})
 }
