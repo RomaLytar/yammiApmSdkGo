@@ -22,12 +22,19 @@ import (
 //
 //  1. O(1) per request, no per-request goroutine, no syscalls beyond
 //     what net/http already does.
-//  2. Zero body capture on success paths — allocating a 4 KiB
-//     bytes.Buffer per request costs more than the trace is worth.
-//     Body capture is only performed for 5xx responses, and only when
-//     the host sets cfg.CaptureErrorBody.
-//  3. sync.Pool for the response recorder so the per-request
-//     allocation is a single atomic pointer swap, not a malloc.
+//  2. responseRecorder is pooled via sync.Pool so per-request cost is
+//     a single atomic pointer swap, not a malloc. The 2 KiB error
+//     buffer inside each pooled recorder is reused across requests.
+//  3. Body capture is automatic for all 4xx and 5xx responses (so the
+//     dashboard always has a "why did this fail" snippet), but the
+//     buffer is only WRITTEN to on those status codes — 2xx hot path
+//     does nothing beyond the status-code check. 4xx bodies usually
+//     carry validation details worth showing, 5xx carry the stack
+//     trace snippet; both are capped at 2 KiB.
+//
+// Opt-out: set CaptureErrorBody=false or APM_CAPTURE_ERROR_BODY=false
+// if you don't want any body capture at all (saves the 2 KiB buffer
+// allocation on first use of a pool slot).
 func HTTP(a *apm.APM) func(http.Handler) http.Handler {
 	if a == nil {
 		return func(next http.Handler) http.Handler { return next }
@@ -53,11 +60,17 @@ func HTTP(a *apm.APM) func(http.Handler) http.Handler {
 			durationMs := float32(time.Since(start).Seconds() * 1000)
 			status := rw.status
 			errMsg := ""
-			// Only parse body on 5xx AND only when explicitly opted in.
-			// 4xx bodies are usually generic ("validation failed") and
-			// not worth the allocation; 2xx/3xx bodies never are.
-			if status >= 500 && rw.captured != nil && rw.captured.Len() > 0 {
+			// Any 4xx or 5xx gets the captured body parsed for a
+			// readable error message. 2xx/3xx never reach this branch,
+			// so the successful path pays no extra cost.
+			if status >= 400 && rw.captured != nil && rw.captured.Len() > 0 {
 				errMsg = extractError(rw.captured.Bytes())
+				if errMsg == "" {
+					// No recognised JSON key — use the raw first-2-KiB
+					// body as-is so the dashboard at least shows
+					// something instead of an empty error field.
+					errMsg = trim(string(rw.captured.Bytes()), 500)
+				}
 			}
 
 			a.PushEvent(apm.Event{
@@ -144,10 +157,11 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 	if !r.wroteHeader {
 		r.WriteHeader(http.StatusOK)
 	}
-	// Lazy capture: only on 5xx AND only when the host opted in. The
-	// 2xx hot path does nothing here — the conditional is one branch,
-	// nothing else.
-	if r.captureErrors && r.status >= 500 {
+	// Lazy capture: only when the host opted in AND the response is
+	// 4xx/5xx. The 2xx hot path checks one integer and falls through
+	// with zero work — no allocation, no branch mispredictions beyond
+	// the comparison itself.
+	if r.captureErrors && r.status >= 400 {
 		if r.captured == nil {
 			r.captured = bytes.NewBuffer(make([]byte, 0, 2048))
 		}

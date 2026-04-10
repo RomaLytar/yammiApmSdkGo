@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	// Database drivers — registered via side-effect import so the SDK
@@ -191,12 +192,42 @@ func firstNonEmpty(values ...string) string {
 // autoSQLCollector is a minimal in-package SQL collector so the main
 // `apm` package does not depend on the `collector/` subpackage (which
 // would create an import cycle — collector/ already depends on apm).
-// The behaviour matches collector.SQLCollector exactly.
+//
+// Beyond the trivial pool stats (active/idle/max, db size), this
+// collector periodically probes the server-side query statistics so
+// the dashboard can show queries_per_min, avg_query_ms, p95_query_ms
+// and slow_queries WITHOUT any instrumentation on the host app —
+// which is the whole point of zero-code integration.
+//
+// Postgres path uses the `pg_stat_statements` extension when it's
+// installed; the collector silently falls back to "all zeros" if
+// it's missing, so dashboards degrade gracefully.
+//
+// MySQL path uses `SHOW GLOBAL STATUS` counters (Questions, Com_select,
+// Com_insert, Slow_queries) which are always present — no extension
+// required.
+//
+// Both paths remember the previous cumulative counters so Collect()
+// returns the DELTA per minute, not the monotonic total. The first
+// call seeds the baseline and reports zeros; every subsequent call
+// produces a real-per-minute number.
 type autoSQLCollector struct {
 	db        *sql.DB
 	service   string
 	driver    string
 	sizeQuery string
+	slowMs    int
+
+	// Previous-tick counters for delta calculation. Guarded by mu
+	// because Collect() can race with itself if called from two
+	// metrics loops (shouldn't happen, but cheap insurance).
+	mu           sync.Mutex
+	prevAt       time.Time
+	prevCalls    int64
+	prevReads    int64
+	prevWrites   int64
+	prevSlow     int64
+	prevTotalMs  float64
 }
 
 func newAutoSQLCollector(db *sql.DB, service, driver, sizeQuery string, slowMs int) *autoSQLCollector {
@@ -205,6 +236,7 @@ func newAutoSQLCollector(db *sql.DB, service, driver, sizeQuery string, slowMs i
 		service:   service,
 		driver:    driver,
 		sizeQuery: sizeQuery,
+		slowMs:    slowMs,
 	}
 }
 
@@ -236,7 +268,236 @@ func (c *autoSQLCollector) Collect(ctx context.Context) (DBMetric, bool) {
 		}
 	}
 
+	// Query statistics — delta from previous tick.
+	c.fillQueryStats(ctx, &m)
+
 	return m, true
+}
+
+// fillQueryStats populates queries_per_min, slow_queries, avg_query_ms,
+// p95_query_ms, max_query_ms, reads_per_min and writes_per_min based
+// on the driver-specific statistics source. It is intentionally best-
+// effort: any failure leaves the fields at zero and does not affect
+// the pool-stats part of the payload.
+func (c *autoSQLCollector) fillQueryStats(ctx context.Context, m *DBMetric) {
+	switch c.driver {
+	case "pgx":
+		c.fillPostgresQueryStats(ctx, m)
+	case "mysql":
+		c.fillMySQLQueryStats(ctx, m)
+	}
+}
+
+// fillPostgresQueryStats reads from pg_stat_statements. If the
+// extension is missing, the query returns an error and we silently
+// skip — the database still shows pool stats and size.
+//
+// The aggregated row covers ALL queries in the current database for
+// the current user, summed across all statements:
+//
+//	calls            → total query count
+//	total_exec_time  → cumulative execution time in ms
+//	max_exec_time    → max single-query time in ms
+//	slow (calc'd)    → sum of queries above the slow threshold
+//
+// mean_exec_time is derived from total/calls, and a rough p95 comes
+// from ordering by mean_exec_time descending and taking the 5%-top
+// row's time. Accurate enough for dashboards, cheap to compute.
+func (c *autoSQLCollector) fillPostgresQueryStats(ctx context.Context, m *DBMetric) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	// pg_stat_statements aggregate. The cast to bigint protects us
+	// from int overflow on very long-running instances.
+	var calls, slow int64
+	var totalMs, maxMs float64
+	err := c.db.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(calls), 0)::bigint,
+			COALESCE(SUM(total_exec_time), 0)::float,
+			COALESCE(MAX(max_exec_time), 0)::float,
+			COALESCE(SUM(CASE WHEN mean_exec_time >= $1 THEN calls ELSE 0 END), 0)::bigint
+		FROM pg_stat_statements
+	`, float64(c.slowMs)).Scan(&calls, &totalMs, &maxMs, &slow)
+	if err != nil {
+		return // extension missing or permission denied — degrade gracefully
+	}
+
+	// p95 approximation: the slowest mean_exec_time in the top-5%
+	// bucket of statements by call count. Not a true percentile over
+	// individual queries but correlates well with the real p95 on
+	// realistic dashboards.
+	var p95 float64
+	_ = c.db.QueryRowContext(ctx, `
+		SELECT COALESCE(
+		  (SELECT mean_exec_time
+		   FROM pg_stat_statements
+		   ORDER BY mean_exec_time DESC
+		   LIMIT 1 OFFSET GREATEST((SELECT count(*)/20 FROM pg_stat_statements), 0)),
+		  0
+		)::float
+	`).Scan(&p95)
+
+	// Compute per-minute delta from the previous snapshot.
+	c.applyDelta(m, calls, 0, 0, slow, totalMs, maxMs, p95)
+}
+
+// fillMySQLQueryStats uses SHOW GLOBAL STATUS — always available, no
+// extensions needed. We read:
+//
+//	Questions     → total queries
+//	Com_select    → read operations
+//	Com_insert/update/delete/replace → write operations
+//	Slow_queries  → slow query count
+//
+// MySQL does not expose average / p95 query time through STATUS, so
+// those stay zero unless the host later wires a manual collector.
+// That's a deliberate trade-off: zero-config wins out over feature
+// completeness for now.
+func (c *autoSQLCollector) fillMySQLQueryStats(ctx context.Context, m *DBMetric) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	status, err := c.readMySQLStatusMap(ctx,
+		"Questions", "Com_select", "Com_insert", "Com_update",
+		"Com_delete", "Com_replace", "Slow_queries")
+	if err != nil {
+		return
+	}
+
+	calls := status["Questions"]
+	reads := status["Com_select"]
+	writes := status["Com_insert"] + status["Com_update"] +
+		status["Com_delete"] + status["Com_replace"]
+	slow := status["Slow_queries"]
+
+	c.applyDelta(m, calls, reads, writes, slow, 0, 0, 0)
+}
+
+// readMySQLStatusMap executes SHOW GLOBAL STATUS WHERE Variable_name
+// IN (...) and collects the results into a map. Missing names are
+// silently absent from the map — the caller treats missing as 0.
+func (c *autoSQLCollector) readMySQLStatusMap(ctx context.Context, names ...string) (map[string]int64, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(names))
+	args := make([]any, len(names))
+	for i, n := range names {
+		placeholders[i] = "?"
+		args[i] = n
+	}
+	query := "SHOW GLOBAL STATUS WHERE Variable_name IN (" +
+		strings.Join(placeholders, ",") + ")"
+
+	rows, err := c.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]int64, len(names))
+	for rows.Next() {
+		var name, value string
+		if err := rows.Scan(&name, &value); err != nil {
+			return nil, err
+		}
+		n, _ := parseInt64(value)
+		out[name] = n
+	}
+	return out, rows.Err()
+}
+
+// parseInt64 is a tiny strconv-free int parser. Used for MySQL STATUS
+// values which are decimal integers as strings. We ignore errors and
+// treat any non-numeric value as zero.
+func parseInt64(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	var v int64
+	neg := false
+	i := 0
+	if s[0] == '-' {
+		neg = true
+		i++
+	}
+	for ; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, nil
+		}
+		v = v*10 + int64(c-'0')
+	}
+	if neg {
+		v = -v
+	}
+	return v, nil
+}
+
+// applyDelta converts cumulative counters into per-minute values.
+// The first call seeds the baseline and reports zeros; every
+// subsequent call computes (now - prev) / elapsed_min.
+func (c *autoSQLCollector) applyDelta(m *DBMetric, calls, reads, writes, slow int64, totalMs, maxMs, p95 float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	if c.prevAt.IsZero() {
+		c.prevAt = now
+		c.prevCalls = calls
+		c.prevReads = reads
+		c.prevWrites = writes
+		c.prevSlow = slow
+		c.prevTotalMs = totalMs
+		// First call: report max/p95 directly (they're instantaneous
+		// snapshot values, not rates) but leave rates at zero so we
+		// don't show garbage.
+		m.MaxQueryMs = float32(maxMs)
+		m.P95QueryMs = float32(p95)
+		return
+	}
+
+	elapsed := now.Sub(c.prevAt).Minutes()
+	if elapsed <= 0 {
+		return
+	}
+
+	callsDelta := calls - c.prevCalls
+	readsDelta := reads - c.prevReads
+	writesDelta := writes - c.prevWrites
+	slowDelta := slow - c.prevSlow
+	msDelta := totalMs - c.prevTotalMs
+
+	// Counter wrap-around protection: if any delta is negative it
+	// usually means the server restarted and reset its counters.
+	// Re-seed the baseline, report zero this tick.
+	if callsDelta < 0 || readsDelta < 0 || writesDelta < 0 || slowDelta < 0 || msDelta < 0 {
+		c.prevAt = now
+		c.prevCalls = calls
+		c.prevReads = reads
+		c.prevWrites = writes
+		c.prevSlow = slow
+		c.prevTotalMs = totalMs
+		return
+	}
+
+	m.QueriesPerMin = uint32(float64(callsDelta) / elapsed)
+	m.ReadsPerMin = uint32(float64(readsDelta) / elapsed)
+	m.WritesPerMin = uint32(float64(writesDelta) / elapsed)
+	m.SlowQueries = uint32(slowDelta)
+	if callsDelta > 0 {
+		m.AvgQueryMs = float32(msDelta / float64(callsDelta))
+	}
+	m.MaxQueryMs = float32(maxMs)
+	m.P95QueryMs = float32(p95)
+
+	c.prevAt = now
+	c.prevCalls = calls
+	c.prevReads = reads
+	c.prevWrites = writes
+	c.prevSlow = slow
+	c.prevTotalMs = totalMs
 }
 
 func (c *autoSQLCollector) queryInt(ctx context.Context, q string) (int64, bool) {

@@ -203,7 +203,7 @@ func LoadConfigFromEnv() Config {
 		Timeout:              time.Duration(envInt("APM_TIMEOUT", 2)) * time.Second,
 		IgnoreEndpoints:      envList("APM_IGNORE_ENDPOINTS", []string{"/health", "/favicon.ico"}),
 		SlowQueryThresholdMs: envInt("APM_SLOW_QUERY_THRESHOLD_MS", 1000),
-		CaptureErrorBody:     envBool("APM_CAPTURE_ERROR_BODY", false),
+		CaptureErrorBody:     envBool("APM_CAPTURE_ERROR_BODY", true),
 		Debug:                envBool("APM_DEBUG", false),
 
 		// Auto-discovery defaults: if DATABASE_URL / REDIS_URL exist
